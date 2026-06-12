@@ -127,7 +127,7 @@ Contributions are welcome from blockchain developers, Soroban smart contract eng
 This project is licensed under the MIT License.
 
 ### Contract Detail
-ID: `CDX7LX7JEKTY6FXPLUZFMXOWQHFL545D4CX2Q2PQTPF5UBXNE3TO7A2A`
+ID: `CCEFK4GEPLHOIWGINEBKDIYORT63SIVBM6MICSCOBCYOPBJLZDPUMHDB`
 
 Stellar Expert:
 
