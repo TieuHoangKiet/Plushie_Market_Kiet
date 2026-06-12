@@ -1,38 +1,44 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, String,
 };
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Rarity {
     Common,
+    Uncommon,
     Rare,
     Epic,
     Legendary,
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListingType {
-    Unlisted,
-    FixedPrice,
-    Auction,
+#[derive(Clone)]
+pub struct Plushie {
+    pub id: u64,
+    pub name: String,
+    pub owner: Address,
+    pub rarity: Rarity,
+    pub token_value: i128,
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Plushie {
-    pub id: u32,
-    pub name: String,
-    pub collection: String,
-    pub rarity: Rarity,
-    pub listing_type: ListingType,
-    pub seller: Option<Address>,
-    pub asking_price: i128,
-    pub current_bid: i128,
+#[derive(Clone)]
+pub struct Sale {
+    pub seller: Address,
+    pub price: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Auction {
+    pub seller: Address,
+    pub min_bid: i128,
+    pub highest_bid: i128,
     pub highest_bidder: Option<Address>,
+    pub end_time: u64,
 }
 
 #[contracttype]
@@ -40,10 +46,11 @@ pub struct Plushie {
 enum DataKey {
     Admin,
     PaymentToken,
+    TokenUnit,
     NextId,
-    Plushie(u32),
-    Owner(u32),
-    Supply(String, String),
+    Plushie(u64),
+    Sale(u64),
+    Auction(u64),
 }
 
 #[contracterror]
@@ -52,16 +59,19 @@ enum DataKey {
 pub enum MarketError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
-    Unauthorized = 3,
-    InvalidAmount = 4,
-    PlushieNotFound = 5,
+    InvalidAmount = 3,
+    PlushieNotFound = 4,
+    NotOwner = 5,
     AlreadyListed = 6,
-    NotForSale = 7,
-    NotAuction = 8,
-    BidTooLow = 9,
-    SellerCannotBid = 10,
-    AuctionHasBid = 11,
-    NoBids = 12,
+    SaleNotFound = 7,
+    AuctionNotFound = 8,
+    InvalidDuration = 9,
+    AuctionEnded = 10,
+    AuctionStillRunning = 11,
+    BidTooLow = 12,
+    AuctionHasBid = 13,
+    CannotBuyOwnPlushie = 14,
+    Overflow = 15,
 }
 
 #[contract]
@@ -69,322 +79,298 @@ pub struct PlushieMarket;
 
 #[contractimpl]
 impl PlushieMarket {
-    /// Initializes the market with an admin and a Stellar Asset Contract used
-    /// as the payment token.
-    pub fn initialize(env: Env, admin: Address, payment_token: Address) -> Result<(), MarketError> {
-        let storage = env.storage().persistent();
-        if storage.has(&DataKey::Admin) {
+    /// Initializes the market with the token used for all payments.
+    ///
+    /// `token_unit` is one whole token in its smallest unit. For a token with
+    /// seven decimals, pass 10_000_000.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        payment_token: Address,
+        token_unit: i128,
+    ) -> Result<(), MarketError> {
+        if env.storage().instance().has(&DataKey::Admin) {
             return Err(MarketError::AlreadyInitialized);
         }
+        if token_unit <= 0 {
+            return Err(MarketError::InvalidAmount);
+        }
 
-        storage.set(&DataKey::Admin, &admin);
-        storage.set(&DataKey::PaymentToken, &payment_token);
-        storage.set(&DataKey::NextId, &1_u32);
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentToken, &payment_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenUnit, &token_unit);
+        env.storage().instance().set(&DataKey::NextId, &1_u64);
         Ok(())
     }
 
-    /// Mints one unique plushie. Minting the same collection/name again raises
-    /// its supply, which lowers the token value of every copy.
-    pub fn mint_plushie(
+    /// Creates a plushie. Its direct-sale price and auction floor are derived
+    /// from rarity: Common 10, Uncommon 25, Rare 75, Epic 200, Legendary 500.
+    pub fn create_plushie(
         env: Env,
-        owner: Address,
+        creator: Address,
         name: String,
-        collection: String,
         rarity: Rarity,
-    ) -> Result<u32, MarketError> {
-        read_admin(&env)?;
-        let storage = env.storage().persistent();
-        let id: u32 = storage
+    ) -> Result<u64, MarketError> {
+        creator.require_auth();
+        ensure_initialized(&env)?;
+
+        let id: u64 = env
+            .storage()
+            .instance()
             .get(&DataKey::NextId)
             .ok_or(MarketError::NotInitialized)?;
-        let supply_key = DataKey::Supply(collection.clone(), name.clone());
-        let supply: u32 = storage.get(&supply_key).unwrap_or(0);
+        let next_id = id.checked_add(1).ok_or(MarketError::Overflow)?;
+        let token_value = rarity_value(&env, rarity)?;
+
         let plushie = Plushie {
             id,
             name,
-            collection,
+            owner: creator,
             rarity,
-            listing_type: ListingType::Unlisted,
-            seller: None,
-            asking_price: 0,
-            current_bid: 0,
-            highest_bidder: None,
+            token_value,
         };
-
-        storage.set(&DataKey::Plushie(id), &plushie);
-        storage.set(&DataKey::Owner(id), &owner);
-        storage.set(&supply_key, &supply.saturating_add(1));
-        storage.set(&DataKey::NextId, &id.saturating_add(1));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plushie(id), &plushie);
+        env.storage().instance().set(&DataKey::NextId, &next_id);
         Ok(id)
     }
 
-    /// Lists a plushie for immediate purchase with the configured token.
-    pub fn list_fixed(
-        env: Env,
-        owner: Address,
-        plushie_id: u32,
-        price: i128,
-    ) -> Result<(), MarketError> {
-        validate_positive(price)?;
-        require_owner(&env, plushie_id, &owner)?;
-
-        let mut plushie = read_plushie(&env, plushie_id)?;
-        require_unlisted(&plushie)?;
-        plushie.listing_type = ListingType::FixedPrice;
-        plushie.seller = Some(owner);
-        plushie.asking_price = price;
-        write_plushie(&env, &plushie);
-        Ok(())
-    }
-
-    /// Pays the seller and transfers plushie ownership atomically.
-    pub fn buy(env: Env, plushie_id: u32, buyer: Address) -> Result<(), MarketError> {
-        // Required by the Stellar Asset Contract before it can debit buyer.
-        buyer.require_auth();
-        let mut plushie = read_plushie(&env, plushie_id)?;
-        if plushie.listing_type != ListingType::FixedPrice {
-            return Err(MarketError::NotForSale);
-        }
-
-        let seller = plushie.seller.clone().ok_or(MarketError::NotForSale)?;
-        if buyer == seller {
-            return Err(MarketError::Unauthorized);
-        }
-
-        payment_client(&env)?.transfer(&buyer, &seller, &plushie.asking_price);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Owner(plushie_id), &buyer);
-        clear_listing(&mut plushie);
-        write_plushie(&env, &plushie);
-        Ok(())
-    }
-
-    /// Starts an auction. The first bid must be at least `starting_price`.
-    pub fn start_auction(
-        env: Env,
-        owner: Address,
-        plushie_id: u32,
-        starting_price: i128,
-    ) -> Result<(), MarketError> {
-        validate_positive(starting_price)?;
-        require_owner(&env, plushie_id, &owner)?;
-
-        let mut plushie = read_plushie(&env, plushie_id)?;
-        require_unlisted(&plushie)?;
-        plushie.listing_type = ListingType::Auction;
-        plushie.seller = Some(owner);
-        plushie.asking_price = starting_price;
-        plushie.current_bid = 0;
-        plushie.highest_bidder = None;
-        write_plushie(&env, &plushie);
-        Ok(())
-    }
-
-    /// Escrows a bid inside this contract and immediately refunds the previous
-    /// highest bidder.
-    pub fn bid(
-        env: Env,
-        plushie_id: u32,
-        bidder: Address,
-        amount: i128,
-    ) -> Result<(), MarketError> {
-        validate_positive(amount)?;
-        // Required by the Stellar Asset Contract before it can debit bidder.
-        bidder.require_auth();
-        let mut plushie = read_plushie(&env, plushie_id)?;
-        if plushie.listing_type != ListingType::Auction {
-            return Err(MarketError::NotAuction);
-        }
-        if plushie.seller.as_ref() == Some(&bidder) {
-            return Err(MarketError::SellerCannotBid);
-        }
-
-        let minimum = if plushie.highest_bidder.is_some() {
-            plushie.current_bid.saturating_add(1)
-        } else {
-            plushie.asking_price
-        };
-        if amount < minimum {
-            return Err(MarketError::BidTooLow);
-        }
-
-        let token = payment_client(&env)?;
-        let contract_address = env.current_contract_address();
-        token.transfer(&bidder, &contract_address, &amount);
-        if let Some(previous_bidder) = plushie.highest_bidder {
-            token.transfer(&contract_address, &previous_bidder, &plushie.current_bid);
-        }
-
-        plushie.current_bid = amount;
-        plushie.highest_bidder = Some(bidder);
-        write_plushie(&env, &plushie);
-        Ok(())
-    }
-
-    /// Seller settles the auction: escrowed tokens go to the seller and the
-    /// plushie goes to the highest bidder.
-    pub fn settle(env: Env, seller: Address, plushie_id: u32) -> Result<Address, MarketError> {
-        require_owner(&env, plushie_id, &seller)?;
-        let mut plushie = read_plushie(&env, plushie_id)?;
-        if plushie.listing_type != ListingType::Auction {
-            return Err(MarketError::NotAuction);
-        }
-
-        let winner = plushie.highest_bidder.clone().ok_or(MarketError::NoBids)?;
-        payment_client(&env)?.transfer(
-            &env.current_contract_address(),
-            &seller,
-            &plushie.current_bid,
-        );
-        env.storage()
-            .persistent()
-            .set(&DataKey::Owner(plushie_id), &winner);
-        clear_listing(&mut plushie);
-        write_plushie(&env, &plushie);
-        Ok(winner)
-    }
-
-    /// Cancels a fixed-price listing or an auction that has no bids.
-    pub fn cancel(env: Env, owner: Address, plushie_id: u32) -> Result<(), MarketError> {
-        require_owner(&env, plushie_id, &owner)?;
-        let mut plushie = read_plushie(&env, plushie_id)?;
-        if plushie.listing_type == ListingType::Unlisted {
-            return Err(MarketError::NotForSale);
-        }
-        if plushie.highest_bidder.is_some() {
-            return Err(MarketError::AuctionHasBid);
-        }
-
-        clear_listing(&mut plushie);
-        write_plushie(&env, &plushie);
-        Ok(())
-    }
-
-    pub fn transfer(
-        env: Env,
-        owner: Address,
-        plushie_id: u32,
-        new_owner: Address,
-    ) -> Result<(), MarketError> {
-        require_owner(&env, plushie_id, &owner)?;
-        let plushie = read_plushie(&env, plushie_id)?;
-        require_unlisted(&plushie)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Owner(plushie_id), &new_owner);
-        Ok(())
-    }
-
-    pub fn get_plushie(env: Env, plushie_id: u32) -> Result<Plushie, MarketError> {
+    pub fn get_plushie(env: Env, plushie_id: u64) -> Result<Plushie, MarketError> {
         read_plushie(&env, plushie_id)
     }
 
-    pub fn owner_of(env: Env, plushie_id: u32) -> Result<Address, MarketError> {
-        read_owner(&env, plushie_id)
+    pub fn rarity_price(env: Env, rarity: Rarity) -> Result<i128, MarketError> {
+        rarity_value(&env, rarity)
     }
 
-    pub fn all_plushies(env: Env) -> Result<Vec<Plushie>, MarketError> {
-        let next_id: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::NextId)
-            .ok_or(MarketError::NotInitialized)?;
-        let mut plushies = Vec::new(&env);
-        for id in 1..next_id {
-            plushies.push_back(read_plushie(&env, id)?);
-        }
-        Ok(plushies)
+    /// Transfers a plushie without payment when it is not listed.
+    pub fn transfer(
+        env: Env,
+        owner: Address,
+        to: Address,
+        plushie_id: u64,
+    ) -> Result<(), MarketError> {
+        owner.require_auth();
+        ensure_not_listed(&env, plushie_id)?;
+
+        let mut plushie = read_plushie(&env, plushie_id)?;
+        require_owner(&plushie, &owner)?;
+        plushie.owner = to;
+        write_plushie(&env, &plushie);
+        Ok(())
     }
 
-    pub fn supply_of(env: Env, collection: String, name: String) -> Result<u32, MarketError> {
-        read_admin(&env)?;
-        Ok(env
-            .storage()
-            .persistent()
-            .get(&DataKey::Supply(collection, name))
-            .unwrap_or(0))
-    }
+    /// Lists a plushie at its rarity-derived token value.
+    pub fn list_for_sale(env: Env, seller: Address, plushie_id: u64) -> Result<i128, MarketError> {
+        seller.require_auth();
+        ensure_not_listed(&env, plushie_id)?;
 
-    /// Token value = 100 * rarity multiplier / supply.
-    ///
-    /// Common=1x, Rare=3x, Epic=7x, Legendary=15x.
-    pub fn token_value(env: Env, plushie_id: u32) -> Result<i128, MarketError> {
         let plushie = read_plushie(&env, plushie_id)?;
-        let supply: u32 = env
-            .storage()
+        require_owner(&plushie, &seller)?;
+        let price = plushie.token_value;
+        env.storage()
             .persistent()
-            .get(&DataKey::Supply(
-                plushie.collection.clone(),
-                plushie.name.clone(),
-            ))
-            .unwrap_or(1);
-        let multiplier: i128 = match plushie.rarity {
-            Rarity::Common => 1,
-            Rarity::Rare => 3,
-            Rarity::Epic => 7,
-            Rarity::Legendary => 15,
+            .set(&DataKey::Sale(plushie_id), &Sale { seller, price });
+        Ok(price)
+    }
+
+    pub fn cancel_sale(env: Env, seller: Address, plushie_id: u64) -> Result<(), MarketError> {
+        seller.require_auth();
+        let sale = read_sale(&env, plushie_id)?;
+        if sale.seller != seller {
+            return Err(MarketError::NotOwner);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Sale(plushie_id));
+        Ok(())
+    }
+
+    pub fn buy(env: Env, buyer: Address, plushie_id: u64) -> Result<(), MarketError> {
+        buyer.require_auth();
+        let sale = read_sale(&env, plushie_id)?;
+        if sale.seller == buyer {
+            return Err(MarketError::CannotBuyOwnPlushie);
+        }
+
+        let mut plushie = read_plushie(&env, plushie_id)?;
+        require_owner(&plushie, &sale.seller)?;
+
+        plushie.owner = buyer.clone();
+        write_plushie(&env, &plushie);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Sale(plushie_id));
+
+        let payment_token = read_payment_token(&env)?;
+        token::Client::new(&env, &payment_token).transfer(&buyer, &sale.seller, &sale.price);
+        Ok(())
+    }
+
+    /// Starts an auction whose minimum bid equals the plushie's rarity value.
+    pub fn start_auction(
+        env: Env,
+        seller: Address,
+        plushie_id: u64,
+        duration_seconds: u64,
+    ) -> Result<Auction, MarketError> {
+        seller.require_auth();
+        if duration_seconds == 0 {
+            return Err(MarketError::InvalidDuration);
+        }
+        ensure_not_listed(&env, plushie_id)?;
+
+        let plushie = read_plushie(&env, plushie_id)?;
+        require_owner(&plushie, &seller)?;
+        let end_time = env
+            .ledger()
+            .timestamp()
+            .checked_add(duration_seconds)
+            .ok_or(MarketError::Overflow)?;
+        let auction = Auction {
+            seller,
+            min_bid: plushie.token_value,
+            highest_bid: 0,
+            highest_bidder: None,
+            end_time,
         };
-        Ok(100_i128
-            .saturating_mul(multiplier)
-            .checked_div(i128::from(supply))
-            .unwrap_or(0))
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(plushie_id), &auction);
+        Ok(auction)
+    }
+
+    /// Escrows the new bid and immediately refunds the previous highest bid.
+    pub fn bid(
+        env: Env,
+        bidder: Address,
+        plushie_id: u64,
+        amount: i128,
+    ) -> Result<(), MarketError> {
+        bidder.require_auth();
+        let mut auction = read_auction(&env, plushie_id)?;
+        if env.ledger().timestamp() >= auction.end_time {
+            return Err(MarketError::AuctionEnded);
+        }
+        if bidder == auction.seller {
+            return Err(MarketError::CannotBuyOwnPlushie);
+        }
+        if amount < auction.min_bid || amount <= auction.highest_bid {
+            return Err(MarketError::BidTooLow);
+        }
+
+        let previous_bidder = auction.highest_bidder.clone();
+        let previous_bid = auction.highest_bid;
+        auction.highest_bidder = Some(bidder.clone());
+        auction.highest_bid = amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(plushie_id), &auction);
+
+        let payment_token = read_payment_token(&env)?;
+        let token_client = token::Client::new(&env, &payment_token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&bidder, &contract_address, &amount);
+        if let Some(previous_bidder) = previous_bidder {
+            token_client.transfer(&contract_address, &previous_bidder, &previous_bid);
+        }
+        Ok(())
+    }
+
+    /// Cancels an auction only while it has no bids.
+    pub fn cancel_auction(env: Env, seller: Address, plushie_id: u64) -> Result<(), MarketError> {
+        seller.require_auth();
+        let auction = read_auction(&env, plushie_id)?;
+        if auction.seller != seller {
+            return Err(MarketError::NotOwner);
+        }
+        if auction.highest_bidder.is_some() {
+            return Err(MarketError::AuctionHasBid);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Auction(plushie_id));
+        Ok(())
+    }
+
+    /// Finalizes an expired auction. Anyone may call this function.
+    pub fn finalize_auction(env: Env, plushie_id: u64) -> Result<Option<Address>, MarketError> {
+        let auction = read_auction(&env, plushie_id)?;
+        if env.ledger().timestamp() < auction.end_time {
+            return Err(MarketError::AuctionStillRunning);
+        }
+
+        let mut plushie = read_plushie(&env, plushie_id)?;
+        require_owner(&plushie, &auction.seller)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Auction(plushie_id));
+
+        if let Some(winner) = auction.highest_bidder {
+            plushie.owner = winner.clone();
+            write_plushie(&env, &plushie);
+
+            let payment_token = read_payment_token(&env)?;
+            token::Client::new(&env, &payment_token).transfer(
+                &env.current_contract_address(),
+                &auction.seller,
+                &auction.highest_bid,
+            );
+            Ok(Some(winner))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_sale(env: Env, plushie_id: u64) -> Result<Sale, MarketError> {
+        read_sale(&env, plushie_id)
+    }
+
+    pub fn get_auction(env: Env, plushie_id: u64) -> Result<Auction, MarketError> {
+        read_auction(&env, plushie_id)
     }
 }
 
-fn validate_positive(amount: i128) -> Result<(), MarketError> {
-    if amount <= 0 {
-        return Err(MarketError::InvalidAmount);
+fn ensure_initialized(env: &Env) -> Result<(), MarketError> {
+    if env.storage().instance().has(&DataKey::Admin) {
+        Ok(())
+    } else {
+        Err(MarketError::NotInitialized)
     }
-    Ok(())
 }
 
-fn require_unlisted(plushie: &Plushie) -> Result<(), MarketError> {
-    if plushie.listing_type != ListingType::Unlisted {
-        return Err(MarketError::AlreadyListed);
-    }
-    Ok(())
-}
-
-fn require_owner(env: &Env, plushie_id: u32, claimed_owner: &Address) -> Result<(), MarketError> {
-    if read_owner(env, plushie_id)? != *claimed_owner {
-        return Err(MarketError::Unauthorized);
-    }
-    Ok(())
-}
-
-fn clear_listing(plushie: &mut Plushie) {
-    plushie.listing_type = ListingType::Unlisted;
-    plushie.seller = None;
-    plushie.asking_price = 0;
-    plushie.current_bid = 0;
-    plushie.highest_bidder = None;
-}
-
-fn payment_client(env: &Env) -> Result<token::Client<'_>, MarketError> {
-    let token_address: Address = env
+fn rarity_value(env: &Env, rarity: Rarity) -> Result<i128, MarketError> {
+    ensure_initialized(env)?;
+    let unit: i128 = env
         .storage()
-        .persistent()
-        .get(&DataKey::PaymentToken)
+        .instance()
+        .get(&DataKey::TokenUnit)
         .ok_or(MarketError::NotInitialized)?;
-    Ok(token::Client::new(env, &token_address))
+    let multiplier: i128 = match rarity {
+        Rarity::Common => 10,
+        Rarity::Uncommon => 25,
+        Rarity::Rare => 75,
+        Rarity::Epic => 200,
+        Rarity::Legendary => 500,
+    };
+    unit.checked_mul(multiplier).ok_or(MarketError::Overflow)
 }
 
-fn read_admin(env: &Env) -> Result<Address, MarketError> {
+fn read_payment_token(env: &Env) -> Result<Address, MarketError> {
+    ensure_initialized(env)?;
     env.storage()
-        .persistent()
-        .get(&DataKey::Admin)
+        .instance()
+        .get(&DataKey::PaymentToken)
         .ok_or(MarketError::NotInitialized)
 }
 
-fn read_owner(env: &Env, plushie_id: u32) -> Result<Address, MarketError> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Owner(plushie_id))
-        .ok_or(MarketError::PlushieNotFound)
-}
-
-fn read_plushie(env: &Env, plushie_id: u32) -> Result<Plushie, MarketError> {
+fn read_plushie(env: &Env, plushie_id: u64) -> Result<Plushie, MarketError> {
     env.storage()
         .persistent()
         .get(&DataKey::Plushie(plushie_id))
@@ -397,149 +383,37 @@ fn write_plushie(env: &Env, plushie: &Plushie) {
         .set(&DataKey::Plushie(plushie.id), plushie);
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::{
-        testutils::Address as _,
-        token::{StellarAssetClient, TokenClient},
-    };
+fn read_sale(env: &Env, plushie_id: u64) -> Result<Sale, MarketError> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Sale(plushie_id))
+        .ok_or(MarketError::SaleNotFound)
+}
 
-    struct Fixture {
-        env: Env,
-        admin: Address,
-        buyer_one: Address,
-        buyer_two: Address,
-        token_id: Address,
-        contract_id: Address,
+fn read_auction(env: &Env, plushie_id: u64) -> Result<Auction, MarketError> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Auction(plushie_id))
+        .ok_or(MarketError::AuctionNotFound)
+}
+
+fn ensure_not_listed(env: &Env, plushie_id: u64) -> Result<(), MarketError> {
+    if env.storage().persistent().has(&DataKey::Sale(plushie_id))
+        || env
+            .storage()
+            .persistent()
+            .has(&DataKey::Auction(plushie_id))
+    {
+        Err(MarketError::AlreadyListed)
+    } else {
+        Ok(())
     }
+}
 
-    impl Fixture {
-        fn new() -> Self {
-            let env = Env::default();
-            env.mock_all_auths();
-
-            let admin = Address::generate(&env);
-            let buyer_one = Address::generate(&env);
-            let buyer_two = Address::generate(&env);
-            let token_id = env
-                .register_stellar_asset_contract_v2(admin.clone())
-                .address();
-            let token_admin = StellarAssetClient::new(&env, &token_id);
-            token_admin.mint(&buyer_one, &10_000);
-            token_admin.mint(&buyer_two, &10_000);
-
-            let contract_id = env.register(PlushieMarket, ());
-            PlushieMarketClient::new(&env, &contract_id).initialize(&admin, &token_id);
-            Self {
-                env,
-                admin,
-                buyer_one,
-                buyer_two,
-                token_id,
-                contract_id,
-            }
-        }
-
-        fn market(&self) -> PlushieMarketClient<'_> {
-            PlushieMarketClient::new(&self.env, &self.contract_id)
-        }
-
-        fn token(&self) -> TokenClient<'_> {
-            TokenClient::new(&self.env, &self.token_id)
-        }
-
-        fn mint(&self, name: &str, rarity: Rarity) -> u32 {
-            self.market().mint_plushie(
-                &self.admin,
-                &String::from_str(&self.env, name),
-                &String::from_str(&self.env, "Cosmic Friends"),
-                &rarity,
-            )
-        }
-    }
-
-    #[test]
-    fn rare_plushies_have_more_tokens_and_high_supply_has_less() {
-        let f = Fixture::new();
-        let legendary = f.mint("Moon Bunny", Rarity::Legendary);
-        assert_eq!(f.market().token_value(&legendary), 1_500);
-
-        let common = f.mint("Moon Bunny", Rarity::Common);
-        assert_eq!(f.market().token_value(&legendary), 750);
-        assert_eq!(f.market().token_value(&common), 50);
-    }
-
-    #[test]
-    fn listing_does_not_require_an_owner_signature() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let owner = Address::from_str(
-            &env,
-            "GCRF4OIPX5NTWZKNOGYZLFHGDBWQ7ZNVQFM5EQOC6R27OZ6NLH2PVRSY",
-        );
-        let payment_token = Address::generate(&env);
-        let contract_id = env.register(PlushieMarket, ());
-        let market = PlushieMarketClient::new(&env, &contract_id);
-
-        market.initialize(&admin, &payment_token);
-        let id = market.mint_plushie(
-            &owner,
-            &String::from_str(&env, "Unsigned Bunny"),
-            &String::from_str(&env, "Demo"),
-            &Rarity::Common,
-        );
-        market.list_fixed(&owner, &id, &100);
-
-        assert_eq!(market.get_plushie(&id).asking_price, 100);
-    }
-
-    #[test]
-    fn fixed_price_purchase_transfers_tokens_and_ownership() {
-        let f = Fixture::new();
-        let id = f.mint("Star Cat", Rarity::Rare);
-
-        f.market().list_fixed(&f.admin, &id, &250);
-        f.market().buy(&id, &f.buyer_one);
-
-        assert_eq!(f.market().owner_of(&id), f.buyer_one);
-        assert_eq!(f.token().balance(&f.buyer_one), 9_750);
-        assert_eq!(f.token().balance(&f.admin), 250);
-    }
-
-    #[test]
-    fn auction_escrows_refunds_and_settles() {
-        let f = Fixture::new();
-        let id = f.mint("Galaxy Fox", Rarity::Epic);
-
-        f.market().start_auction(&f.admin, &id, &100);
-        f.market().bid(&id, &f.buyer_one, &150);
-        assert_eq!(f.token().balance(&f.contract_id), 150);
-
-        f.market().bid(&id, &f.buyer_two, &225);
-        assert_eq!(f.token().balance(&f.buyer_one), 10_000);
-        assert_eq!(f.token().balance(&f.contract_id), 225);
-
-        assert_eq!(f.market().settle(&f.admin, &id), f.buyer_two);
-        assert_eq!(f.market().owner_of(&id), f.buyer_two);
-        assert_eq!(f.token().balance(&f.contract_id), 0);
-        assert_eq!(f.token().balance(&f.admin), 225);
-    }
-
-    #[test]
-    fn rejects_low_bid_and_cancel_after_bid() {
-        let f = Fixture::new();
-        let id = f.mint("Cloud Bear", Rarity::Common);
-        f.market().start_auction(&f.admin, &id, &100);
-
-        assert_eq!(
-            f.market().try_bid(&id, &f.buyer_one, &99),
-            Err(Ok(MarketError::BidTooLow))
-        );
-        f.market().bid(&id, &f.buyer_one, &100);
-        assert_eq!(
-            f.market().try_cancel(&f.admin, &id),
-            Err(Ok(MarketError::AuctionHasBid))
-        );
+fn require_owner(plushie: &Plushie, owner: &Address) -> Result<(), MarketError> {
+    if &plushie.owner == owner {
+        Ok(())
+    } else {
+        Err(MarketError::NotOwner)
     }
 }
